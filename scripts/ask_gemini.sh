@@ -71,18 +71,64 @@ fi
 require_cmd curl
 require_cmd jq
 
-# --- Resolve API key ---
+# --- Unified config resolution ---
+# Reads from two sources: environment variables and ~/.config/gemini-designer/config.
+# If both sources provide a value and they differ, the user is prompted to choose.
+# Priority when only one source is present: whichever has a value wins.
+# Non-interactive environments (no TTY): env var takes priority automatically.
 
-api_key=""
+CONFIG_FILE="$HOME/.config/gemini-designer/config"
 
-# 1. Environment variable (prioritize GEMINI_API_KEY, fallback to ZENMUX_API_KEY)
-if [[ -n "${GEMINI_API_KEY:-}" ]]; then
-  api_key="$GEMINI_API_KEY"
-elif [[ -n "${ZENMUX_API_KEY:-}" ]]; then
-  api_key="$ZENMUX_API_KEY"
-fi
+# Read all values from config file
+_read_cfg() {
+  [[ -f "$CONFIG_FILE" ]] && grep -E "^$1=" "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || echo ""
+}
+cfg_api_key="$(_read_cfg GEMINI_API_KEY)"
+cfg_base_url="$(_read_cfg GOOGLE_GEMINI_BASE_URL)"
+cfg_model="$(_read_cfg GEMINI_MODEL)"
 
-# 2. Project .env.local (if running inside a project)
+# Helper: resolve a single config variable from env + config file.
+# If both sources have different values, prompt the user to choose.
+choose_value() {
+  local label="$1" env_val="$2" cfg_val="$3"
+  # Strip surrounding whitespace
+  env_val="$(echo "$env_val" | tr -d '[:space:]')" 2>/dev/null || true
+  cfg_val="$(echo "$cfg_val" | tr -d '[:space:]')" 2>/dev/null || true
+
+  if [[ -n "$env_val" && -n "$cfg_val" && "$env_val" != "$cfg_val" ]]; then
+    # Both present and different — ask the user if a TTY is available
+    if tty >/dev/null 2>&1; then
+      echo "[CONFIG] $label found in two sources with different values:" >&2
+      echo "  1) env var : $env_val" >&2
+      echo "  2) config  : $cfg_val ($CONFIG_FILE)" >&2
+      local choice
+      while true; do
+        printf "Which should be used? [1/2]: " >&2
+        read -r choice </dev/tty
+        case "$choice" in
+          1) echo "$env_val"; return ;;
+          2) echo "$cfg_val"; return ;;
+          *) echo "  Please enter 1 or 2." >&2 ;;
+        esac
+      done
+    else
+      echo "[INFO] $label: both env and config have values; using env var (non-interactive)." >&2
+      echo "$env_val"
+    fi
+  elif [[ -n "$env_val" ]]; then
+    echo "$env_val"
+  elif [[ -n "$cfg_val" ]]; then
+    echo "$cfg_val"
+  else
+    echo ""
+  fi
+}
+
+# Resolve GEMINI_API_KEY
+env_api_key="${GEMINI_API_KEY:-${ZENMUX_API_KEY:-}}"
+api_key="$(choose_value "GEMINI_API_KEY" "$env_api_key" "$cfg_api_key")"
+
+# .env.local fallback (project-level, checked if still empty)
 if [[ -z "$api_key" ]]; then
   for candidate in ".env.local" "../.env.local" "../../.env.local"; do
     if [[ -f "$candidate" ]]; then
@@ -100,21 +146,24 @@ if [[ -z "$api_key" ]]; then
   done
 fi
 
-# 3. Global config
+# Legacy api_key file fallback
 if [[ -z "$api_key" && -f "$HOME/.config/gemini-designer/api_key" ]]; then
   api_key="$(cat "$HOME/.config/gemini-designer/api_key" | tr -d '[:space:]')"
 fi
 
 if [[ -z "$api_key" ]]; then
   echo "[ERROR] No API key found." >&2
-  echo "Set GEMINI_API_KEY env var, or add it to .env.local, or save to ~/.config/gemini-designer/api_key" >&2
+  echo "Set GEMINI_API_KEY in env, .env.local, or $CONFIG_FILE" >&2
   exit 1
 fi
 
-# --- API Configuration ---
-base_url="${GOOGLE_GEMINI_BASE_URL:-https://linkapi.ai}"
+# Resolve GOOGLE_GEMINI_BASE_URL and GEMINI_MODEL
+base_url="$(choose_value "GOOGLE_GEMINI_BASE_URL" "${GOOGLE_GEMINI_BASE_URL:-}" "$cfg_base_url")"
+base_url="${base_url:-https://linkapi.ai}"
 base_url="${base_url%/}"
-model="${GEMINI_MODEL:-gemini-2.0-flash}"
+
+model="$(choose_value "GEMINI_MODEL" "${GEMINI_MODEL:-}" "$cfg_model")"
+model="${model:-gemini-2.0-flash}"
 
 # --- Resolve task text ---
 
