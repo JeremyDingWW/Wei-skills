@@ -201,6 +201,7 @@ execute.sh "Implement login" --partner gemini --html
 | 参数 | 说明 |
 |------|------|
 | `--partner <codex\|gemini>` | 手动指定执行伙伴 |
+| `--check` | 验证两个执行脚本是否已安装且有执行权限，安装排查专用 |
 
 ---
 
@@ -208,13 +209,16 @@ execute.sh "Implement login" --partner gemini --html
 
 脚本通过分析任务描述中的关键词来自动路由：
 
-**→ 路由到 Codex（代码任务）**：
-`implement` `refactor` `test` `fix` `bug` `function` `class` `component` `API` `code` `write` `add` `update` `create`
+脚本使用**加权评分**机制，Score > 0 路由到 Gemini，否则路由到 Codex：
 
-**→ 路由到 Gemini（设计任务）**：
-`design` `mockup` `UI` `UX` `icon` `SVG` `HTML` `layout` `color` `palette` `typography` `visual` `style` `form` `button` `page` `website` `landing` `card` `modal`
+| 权重 | 信号 | 关键词示例 |
+|------|------|-----------|
+| +2（强设计） | 明确设计意图 | `design a` `design the` `mockup` `ui design` `color palette` `landing page` |
+| +1（弱设计） | 设计相关词 | `icon` `svg` `html` `layout` `color` `palette` `visual` `style` |
+| -1（代码上下文） | 中和歧义词 | `handler` `middleware` `controller` `service` `hook` `component` `validate` |
+| -2（强代码） | 明确代码意图 | `refactor` `write tests` `unit test` `fix bug` `implement` `debug` |
 
-> 若关键词模糊，默认路由到 **Codex**。
+> 若评分为 0 或无法判断，默认路由到 **Codex**。
 
 ---
 
@@ -248,10 +252,10 @@ ModelMesh/
 ├── README.md              # 使用文档（本文件）
 ├── LICENSE                # MIT 开源协议
 └── scripts/
-    ├── execute.sh          # 主执行脚本（跨平台路由）
-    ├── ask_codex.sh        # Codex 脚本（macOS / Linux）
-    ├── ask_codex_windows.sh # Codex 脚本（Windows / Git Bash）
-    └── ask_gemini.sh       # Gemini Designer 脚本
+    ├── execute.sh          # 主执行脚本（路由判断，跨平台入口）
+    ├── ask_codex.sh        # Codex 执行脚本（macOS / Linux）
+    ├── ask_codex_windows.sh # Codex 执行脚本（Windows / Git Bash）
+    └── ask_gemini.sh       # Gemini 执行脚本（设计任务，调用 Gemini API）
 ```
 
 ---
