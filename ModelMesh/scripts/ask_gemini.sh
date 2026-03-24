@@ -35,6 +35,17 @@ require_cmd() {
   fi
 }
 
+# --- Windows compatibility ---
+IS_WINDOWS=false
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=true ;;
+esac
+
+# Strip carriage returns from a string (Windows line endings)
+strip_cr() {
+  printf '%s' "$1" | tr -d '\r'
+}
+
 # --- Parse arguments ---
 
 task_text=""
@@ -79,9 +90,9 @@ require_cmd jq
 
 CONFIG_FILE="$HOME/.config/gemini-designer/config"
 
-# Read all values from config file
+# Read all values from config file (strip \r for Windows line endings)
 _read_cfg() {
-  [[ -f "$CONFIG_FILE" ]] && grep -E "^$1=" "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || echo ""
+  [[ -f "$CONFIG_FILE" ]] && grep -E "^$1=" "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" | tr -d '\r' || echo ""
 }
 cfg_api_key="$(_read_cfg GEMINI_API_KEY)"
 cfg_base_url="$(_read_cfg GOOGLE_GEMINI_BASE_URL)"
@@ -132,9 +143,9 @@ api_key="$(choose_value "GEMINI_API_KEY" "$env_api_key" "$cfg_api_key")"
 if [[ -z "$api_key" ]]; then
   for candidate in ".env.local" "../.env.local" "../../.env.local"; do
     if [[ -f "$candidate" ]]; then
-      found="$(grep -E '^GEMINI_API_KEY=' "$candidate" 2>/dev/null | head -1 | cut -d= -f2-)"
+      found="$(grep -E '^GEMINI_API_KEY=' "$candidate" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
       if [[ -z "$found" ]]; then
-        found="$(grep -E '^ZENMUX_API_KEY=' "$candidate" 2>/dev/null | head -1 | cut -d= -f2-)"
+        found="$(grep -E '^ZENMUX_API_KEY=' "$candidate" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
       fi
       found="${found//\'/}"
       found="${found//\"/}"
@@ -154,15 +165,15 @@ fi
 # ~/.gemini/.env fallback
 if [[ -z "$api_key" && -f "$HOME/.gemini/.env" ]]; then
   _gemini_env="$HOME/.gemini/.env"
-  _found_key="$(grep -E '^GEMINI_API_KEY=' "$_gemini_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+  _found_key="$(grep -E '^GEMINI_API_KEY=' "$_gemini_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]\r')"
   if [[ -n "$_found_key" ]]; then
     api_key="$_found_key"
     # Also load BASE_URL and MODEL from this file if not already set
     if [[ -z "${GOOGLE_GEMINI_BASE_URL:-}" && -z "$cfg_base_url" ]]; then
-      cfg_base_url="$(grep -E '^GOOGLE_GEMINI_BASE_URL=' "$_gemini_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+      cfg_base_url="$(grep -E '^GOOGLE_GEMINI_BASE_URL=' "$_gemini_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]\r')"
     fi
     if [[ -z "${GEMINI_MODEL:-}" && -z "$cfg_model" ]]; then
-      cfg_model="$(grep -E '^GEMINI_MODEL=' "$_gemini_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+      cfg_model="$(grep -E '^GEMINI_MODEL=' "$_gemini_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]\r')"
     fi
   fi
 fi
@@ -225,6 +236,11 @@ if [[ -z "$output_path" ]]; then
   output_dir="${PWD}/.runtime/gemini-designer"
   mkdir -p "$output_dir"
   output_path="${output_dir}/${timestamp}.${file_ext}"
+else
+  # On Windows (Git Bash), convert backslashes to forward slashes
+  if [[ "$IS_WINDOWS" == true ]]; then
+    output_path="${output_path//\\//}"
+  fi
 fi
 mkdir -p "$(dirname "$output_path")"
 
@@ -253,6 +269,10 @@ jq -n \
 response_file="$(mktemp)"
 trap 'rm -f "$prompt_file" "$request_file" "$response_file"' EXIT
 
+api_mode="openai"
+
+# --- Attempt 1: OpenAI-compatible format ---
+# Use || true to prevent set -e from exiting on curl failure (e.g. SSL errors)
 http_code="$(curl -s -w "%{http_code}" -o "$response_file" \
   -X POST "${base_url}/v1/chat/completions" \
   -H "Content-Type: application/json" \
@@ -262,17 +282,51 @@ http_code="$(curl -s -w "%{http_code}" -o "$response_file" \
   -H "Accept-Language: en-US,en;q=0.9" \
   --connect-timeout 30 \
   --max-time 120 \
-  -d @"$request_file")"
+  -d @"$request_file")" || http_code="000"
 
+# --- Attempt 2: Fallback to native Gemini API ---
 if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
-  echo "[ERROR] API returned HTTP ${http_code}" >&2
-  cat "$response_file" >&2
-  exit 1
+  echo "[INFO] OpenAI format failed (HTTP ${http_code}), falling back to native Gemini API..." >&2
+  api_mode="native"
+
+  # Build native Gemini request body
+  native_request_file="$(mktemp)"
+  trap 'rm -f "$prompt_file" "$request_file" "$response_file" "$native_request_file"' EXIT
+
+  jq -n \
+    --arg system "$system_prompt" \
+    --rawfile user "$prompt_file" \
+    '{
+      systemInstruction: { parts: [{ text: $system }] },
+      contents: [{ parts: [{ text: $user }] }]
+    }' > "$native_request_file"
+
+  http_code="$(curl -s -w "%{http_code}" -o "$response_file" \
+    -X POST "${base_url}/v1beta/models/${model}:generateContent" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${api_key}" \
+    -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+    -H "Accept: application/json" \
+    --connect-timeout 30 \
+    --max-time 120 \
+    -d @"$native_request_file")"
+
+  if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+    echo "[ERROR] Native Gemini API also failed (HTTP ${http_code})" >&2
+    cat "$response_file" >&2
+    exit 1
+  fi
+  echo "[INFO] Native Gemini API succeeded." >&2
 fi
 
 # --- Extract content ---
 
-content="$(jq -r '.choices[0].message.content // empty' < "$response_file")"
+if [[ "$api_mode" == "openai" ]]; then
+  content="$(jq -r '.choices[0].message.content // empty' < "$response_file")"
+else
+  # Native Gemini format: extract text parts, filtering out thought parts
+  content="$(jq -r '[.candidates[0].content.parts[] | select(.thought != true) | .text] | join("")' < "$response_file")"
+fi
 
 if [[ -z "$content" ]]; then
   echo "[ERROR] Empty response from API" >&2
